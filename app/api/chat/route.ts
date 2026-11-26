@@ -1,195 +1,185 @@
-/**
- * POST /api/chat
- *
- * Server-side route that proxies messages to Gemini.
- * The GEMINI_API_KEY env var is never exposed to the browser.
- *
- * Request body (JSON):
- *   {
- *     message: string          // the user's question
- *     history: Array<{ role: 'user'|'assistant', text: string }>
- *     farmContext?: {          // optional — only sent when available
- *       region?: string
- *       season?: string
- *       water?: string
- *       soilMode?: string
- *       texture?: string
- *       soilColor?: string
- *       moisture?: string
- *       nitrogen?: string
- *       phosphorus?: string
- *       potassium?: string
- *       ph?: string
- *       budget?: string
- *       fertilizer?: string
- *       crop?: string
- *     }
- *   }
- *
- * Response body (JSON):
- *   { reply: string } | { error: string }
- */
-
+import { GoogleGenAI } from '@google/genai'
 import { NextRequest, NextResponse } from 'next/server'
 
-// ── Gemini availability check ─────────────────────────────────────────────────
+export const runtime = 'nodejs'
 
-function isGeminiConfigured(): boolean {
-  return Boolean(process.env.GEMINI_API_KEY)
+const MODEL = 'gemini-3.8-flash'
+const MAX_BODY_CHARS = 12_000
+const MAX_MESSAGE_CHARS = 1_500
+const MAX_HISTORY_ITEMS = 8
+const MAX_HISTORY_TEXT_CHARS = 1_000
+
+type JsonRecord = Record<string, unknown>
+type ChatMessage = {
+  role: 'user' | 'model'
+  parts: { text: string }[]
 }
 
-// ── Farm context → readable text ──────────────────────────────────────────────
-
-type FarmContext = {
-  region?: string
-  season?: string
-  water?: string
-  soilMode?: string
-  texture?: string
-  soilColor?: string
-  moisture?: string
-  nitrogen?: string
-  phosphorus?: string
-  potassium?: string
-  ph?: string
-  budget?: string
-  fertilizer?: string
-  crop?: string
+function isRecord(value: unknown): value is JsonRecord {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function buildFarmContextText(ctx: FarmContext): string {
-  const lines: string[] = []
-  if (ctx.region) lines.push(`Region / district: ${ctx.region}`)
-  if (ctx.season) lines.push(`Season: ${ctx.season}`)
-  if (ctx.water) lines.push(`Water access: ${ctx.water}`)
-  if (ctx.soilMode === 'report') {
-    const parts = [
-      ctx.nitrogen ? `N ${ctx.nitrogen}` : null,
-      ctx.phosphorus ? `P ${ctx.phosphorus}` : null,
-      ctx.potassium ? `K ${ctx.potassium}` : null,
-      ctx.ph ? `pH ${ctx.ph}` : null,
-    ].filter(Boolean)
-    if (parts.length) lines.push(`Soil (lab report): ${parts.join(', ')}`)
-  } else if (ctx.soilMode === 'visual') {
-    const parts = [ctx.texture, ctx.soilColor, ctx.moisture].filter(Boolean)
-    if (parts.length) lines.push(`Soil (visual estimate): ${parts.join(', ')}`)
-  }
-  if (ctx.budget) lines.push(`Budget preference: ${ctx.budget}`)
-  if (ctx.fertilizer) lines.push(`Fertilizer access: ${ctx.fertilizer}`)
-  if (ctx.crop) lines.push(`Crop being discussed: ${ctx.crop}`)
-  return lines.join('\n')
+function safeText(value: unknown, limit = 120): string {
+  return typeof value === 'string' ? value.trim().slice(0, limit) : ''
 }
 
-// ── System prompt ─────────────────────────────────────────────────────────────
+function getFarmContext(value: unknown): string {
+  if (!isRecord(value)) return ''
 
-function buildSystemPrompt(farmContextText: string): string {
-  return `You are GrowWise Field Notes, a friendly and cautious crop-planning assistant for small-scale farmers.
+  const fields: Array<[string, string]> = [
+    ['region', 'Region'],
+    ['season', 'Season'],
+    ['water', 'Water access'],
+    ['soilMode', 'Soil input type'],
+    ['texture', 'Soil texture'],
+    ['soilColor', 'Soil color'],
+    ['moisture', 'Soil moisture'],
+    ['nitrogen', 'Nitrogen from report'],
+    ['phosphorus', 'Phosphorus from report'],
+    ['potassium', 'Potassium from report'],
+    ['ph', 'Soil pH from report'],
+    ['budget', 'Budget preference'],
+    ['fertilizer', 'Fertilizer access'],
+    ['crop', 'Crop being discussed'],
+  ]
 
-Your role is to help farmers think through their crop choices, understand what factors matter, and know what questions to ask a local expert. You are a decision-support tool, not a certified agronomist.
-
-RULES — follow these strictly:
-1. Never promise specific crop yields, income projections, or guaranteed outcomes.
-2. Never invent or state specific weather forecasts or current rainfall data as fact.
-3. Never give unverified exact farming instructions (e.g. "apply 50 kg/ha of urea") without noting that amounts should be confirmed locally.
-4. For important or high-risk decisions, always encourage the farmer to consult a local agricultural extension officer or agronomist.
-5. Keep answers practical, plain, and grounded in what the farmer has shared.
-6. If you are uncertain, say so clearly rather than guessing.
-7. Be respectful of local knowledge — the farmer may know things about their land that you do not.
-8. Responses should be concise and easy to understand, ideally suitable for someone reading on a mobile phone.
-
-${farmContextText ? `FARMER'S CURRENT CONTEXT:\n${farmContextText}\n\nUse this context to give more relevant answers, but acknowledge any missing or uncertain information.\n` : 'No farm context is available yet. Provide general guidance and remind the farmer to share their farm details for more relevant answers.\n'}`
+  return fields
+    .map(([key, label]) => {
+      const fieldValue = safeText(value[key])
+      return fieldValue ? `${label}: ${fieldValue}` : ''
+    })
+    .filter(Boolean)
+    .join('\n')
 }
 
-// ── Demo fallback responses ───────────────────────────────────────────────────
+function buildSystemPrompt(farmContext: string): string {
+  const context = farmContext
+    ? `Farm details supplied by the user:\n${farmContext}`
+    : 'The user has not supplied farm details.'
 
-function demoReply(message: string, farmContextText: string): string {
-  const lower = message.toLowerCase()
-  const hasContext = farmContextText.length > 0
-
-  const contextNote = hasContext
-    ? `\n\n*Your farm context was noted but I'm running in demo mode — connect a Gemini API key for real AI responses.*`
-    : `\n\n*I'm in demo mode. Connect a Gemini API key for real AI responses.*`
-
-  if (lower.includes('why') || lower.includes('suggest')) {
-    return `In demo mode, suggestions are illustrative. They show how factors like season, water access, and soil type can shape crop priorities. To get real AI-powered explanations, please add a Gemini API key to your environment.${contextNote}`
-  }
-  if (lower.includes('missing') || lower.includes('information')) {
-    return `Key information often missing includes: current local weather, a lab-verified soil test, local crop variety guidance, and field-specific drainage. A local extension officer can help fill these gaps.${contextNote}`
-  }
-  if (lower.includes('verify') || lower.includes('local') || lower.includes('expert')) {
-    return `Before acting on any suggestion, it's worth checking with a local agricultural extension officer about: suitable varieties for your area, the best planting window, water and drainage requirements, and post-harvest options.${contextNote}`
-  }
-  return `This is a demo response — Gemini is not connected yet.\n\nYou asked: *"${message}"*\n\nTo get real AI-powered crop advice, add your GEMINI_API_KEY to the .env.local file and restart the server.${contextNote}`
+  return [
+    'You are GrowWise, a cautious crop-planning helper for small-scale farmers.',
+    'Use plain, friendly language and keep answers short.',
+    'You are not a certified agronomist. Never promise yields, income, or guaranteed outcomes.',
+    'Do not invent live weather, local conditions, or official recommendations.',
+    'Do not give exact fertilizer or pesticide rates. Ask the user to confirm amounts and timing with a local agricultural extension officer.',
+    'When information is missing, say what is unknown and what the farmer can check locally.',
+    context,
+  ].join('\n\n')
 }
-
-// ── Route handler ─────────────────────────────────────────────────────────────
 
 export async function POST(request: NextRequest) {
+  let body: unknown
+
   try {
-    const body = await request.json()
-    const message: string = (body.message ?? '').trim()
-    const history: Array<{ role: string; text: string }> = body.history ?? []
-    const farmContext: FarmContext = body.farmContext ?? {}
+    const rawBody = await request.text()
 
-    if (!message) {
-      return NextResponse.json({ error: 'Message is required.' }, { status: 400 })
+    if (rawBody.length > MAX_BODY_CHARS) {
+      return NextResponse.json(
+        { error: 'Message is too large.' },
+        { status: 413 }
+      )
     }
 
-    const farmContextText = buildFarmContextText(farmContext)
+    body = JSON.parse(rawBody)
+  } catch {
+    return NextResponse.json(
+      { error: 'Request body must be valid JSON.' },
+      { status: 400 }
+    )
+  }
 
-    // ── Demo mode (no Gemini key) ──────────────────────────────────────────
-    if (!isGeminiConfigured()) {
-      // Small artificial delay so the loading state is visible
-      await new Promise((r) => setTimeout(r, 600))
-      return NextResponse.json({ reply: demoReply(message, farmContextText) })
-    }
+  if (!isRecord(body)) {
+    return NextResponse.json({ error: 'Invalid request.' }, { status: 400 })
+  }
 
-    // ── Live Gemini response ───────────────────────────────────────────────
-    const { GoogleGenAI } = await import('@google/genai')
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! })
+  const message = safeText(body.message, MAX_MESSAGE_CHARS)
 
-    // Build conversation history for multi-turn context
-    const contents: Array<{ role: string; parts: Array<{ text: string }> }> = []
+  if (!message) {
+    return NextResponse.json(
+      { error: 'Enter a question first.' },
+      { status: 400 }
+    )
+  }
 
-    for (const msg of history) {
-      contents.push({
-        role: msg.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: msg.text }],
-      })
-    }
+  const apiKey = process.env.GEMINI_API_KEY
 
-    // Add the new user message
-    contents.push({ role: 'user', parts: [{ text: message }] })
+  if (!apiKey) {
+    return NextResponse.json(
+      {
+        error:
+          'Gemini is not configured. Add GEMINI_API_KEY to .env.local and restart the app.',
+      },
+      { status: 503 }
+    )
+  }
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
+  const history: ChatMessage[] = Array.isArray(body.history)
+    ? body.history
+        .slice(-MAX_HISTORY_ITEMS)
+        .flatMap((item): ChatMessage[] => {
+          if (
+            !isRecord(item) ||
+            (item.role !== 'user' && item.role !== 'assistant')
+          ) {
+            return []
+          }
+
+          const text = safeText(item.text, MAX_HISTORY_TEXT_CHARS)
+          if (!text) return []
+
+          return [
+            {
+              role: item.role === 'assistant' ? 'model' : 'user',
+              parts: [{ text }],
+            },
+          ]
+        })
+    : []
+
+  const contents: ChatMessage[] = [
+    ...history,
+    { role: 'user', parts: [{ text: message }] },
+  ]
+
+  try {
+    const ai = new GoogleGenAI({ apiKey })
+
+    const result = await ai.models.generateContent({
+      model: MODEL,
       contents,
       config: {
-        systemInstruction: buildSystemPrompt(farmContextText),
-        maxOutputTokens: 600,
-        temperature: 0.5,
+        systemInstruction: buildSystemPrompt(
+          getFarmContext(body.farmContext)
+        ),
+        maxOutputTokens: 450,
+        temperature: 0.4,
       },
     })
 
-    const reply = response.text ?? ''
+    const reply = result.text?.trim()
+
     if (!reply) {
-      return NextResponse.json({ error: 'The AI returned an empty response. Please try again.' }, { status: 500 })
+      return NextResponse.json(
+        { error: 'Gemini returned an empty reply. Please try again.' },
+        { status: 502 }
+      )
     }
 
     return NextResponse.json({ reply })
-  } catch (err: unknown) {
-    console.error('[/api/chat] error:', err)
-    const message = err instanceof Error ? err.message : 'Unknown error'
-    // Surface quota / auth errors clearly so the developer can act on them
-    if (message.includes('API key') || message.includes('quota') || message.includes('429')) {
-      return NextResponse.json(
-        { error: 'Gemini API error: ' + message + ' Check your GEMINI_API_KEY and quota.' },
-        { status: 503 }
-      )
-    }
+  } catch (error) {
+    // Log the error type only. Do not log the API key or user message.
+    console.error(
+      '[api/chat] Gemini request failed:',
+      error instanceof Error ? error.name : 'unknown'
+    )
+
     return NextResponse.json(
-      { error: 'Something went wrong with the AI assistant. Please try again.' },
-      { status: 500 }
+      {
+        error:
+          'Gemini could not answer. Check the API key, model access, and usage limit.',
+      },
+      { status: 502 }
     )
   }
 }
