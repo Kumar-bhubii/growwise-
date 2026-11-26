@@ -1,17 +1,118 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import Image from 'next/image'
-import { ArrowRight, ChevronDown, CircleHelp, Globe2, Leaf, Menu, MessageCircle, ShieldCheck, Sprout, X, Sun, MapPin, LogOut, Loader2 } from 'lucide-react'
+import {
+  ArrowRight, ChevronDown, CircleHelp, Globe2, Leaf, Menu, MessageCircle,
+  ShieldCheck, Sprout, X, Sun, MapPin, LogOut, Loader2,
+} from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { GrowWiseWizard } from '@/components/growwise-wizard'
 import { CropDashboard, CropDetail } from '@/components/crop-dashboard'
 import { AdvisorPanel } from '@/components/advisor-panel'
-import { demoCrops, initialProfile, type Crop, type FarmProfile, type View } from '@/lib/growwise'
+import {
+  demoCrops, initialProfile,
+  type Crop, type CropsState, type FarmProfile, type View, type WeatherState,
+} from '@/lib/growwise'
 import { LocaleProvider, TranslateTree, languageNames, translateText, type Language } from '@/lib/i18n'
 import { VoiceInput } from '@/components/voice-input'
 import { useAuth } from '@/lib/use-auth'
 import { isSupabaseConfigured } from '@/lib/supabase'
+
+// ── Weather fetcher ───────────────────────────────────────────────────────────
+
+async function fetchWeather(location: string): Promise<WeatherState> {
+  try {
+    const res = await fetch('/api/weather', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ location }),
+    })
+    const data: unknown = await res.json()
+    if (!res.ok || typeof data !== 'object' || data === null || 'error' in data) {
+      const errData = data as Record<string, unknown>
+      return {
+        status: 'error',
+        message: typeof errData.error === 'string' ? errData.error : 'Weather unavailable.',
+        notFound: errData.notFound === true,
+      }
+    }
+    return { status: 'success', data: data as WeatherState & { status: 'success' } extends { data: infer D } ? D : never }
+  } catch {
+    return { status: 'error', message: 'Could not reach the weather service.' }
+  }
+}
+
+// ── Crop recommendations fetcher ──────────────────────────────────────────────
+
+async function fetchCrops(profile: FarmProfile, countryCode: string): Promise<CropsState> {
+  try {
+    const res = await fetch('/api/crops', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        location: profile.location,
+        soilMode: profile.soilMode,
+        texture: profile.texture,
+        water: profile.water,
+        season: profile.season,
+        ph: profile.ph,
+        countryCode,
+      }),
+    })
+    const data: unknown = await res.json()
+    if (!res.ok || typeof data !== 'object' || data === null || 'error' in data) {
+      const errData = data as Record<string, unknown>
+      return {
+        status: 'error',
+        message: typeof errData.error === 'string' ? errData.error : 'Could not load recommendations.',
+      }
+    }
+    const d = data as {
+      crops: Crop[]
+      dataSourceNote: string
+      faoDataAvailable: boolean
+      unverifiedRegion: boolean
+      fetchedAt: string
+    }
+    return {
+      status: 'success',
+      crops: d.crops,
+      dataSourceNote: d.dataSourceNote,
+      faoDataAvailable: d.faoDataAvailable,
+      unverifiedRegion: d.unverifiedRegion,
+      fetchedAt: d.fetchedAt,
+    }
+  } catch {
+    return { status: 'error', message: 'Could not reach the recommendations service.' }
+  }
+}
+
+// ── Extract ISO 2-letter country code from geocoder result ─────────────────────
+// We piggyback on the weather response which includes location display text.
+// As a fallback we ask the geocoding API directly.
+
+async function resolveCountryCode(location: string): Promise<string> {
+  try {
+    const url = new URL('https://geocoding-api.open-meteo.com/v1/search')
+    url.searchParams.set('name', location)
+    url.searchParams.set('count', '1')
+    url.searchParams.set('language', 'en')
+    url.searchParams.set('format', 'json')
+    const res = await fetch(url.toString(), { signal: AbortSignal.timeout(6000) })
+    if (!res.ok) return ''
+    const json: unknown = await res.json()
+    if (typeof json !== 'object' || json === null) return ''
+    const results = (json as Record<string, unknown>).results
+    if (!Array.isArray(results) || results.length === 0) return ''
+    const r = results[0] as Record<string, unknown>
+    return typeof r.country_code === 'string' ? r.country_code.toUpperCase() : ''
+  } catch {
+    return ''
+  }
+}
+
+// ── Component ─────────────────────────────────────────────────────────────────
 
 export function GrowWiseApp() {
   const [view, setView] = useState<View>('welcome')
@@ -28,6 +129,11 @@ export function GrowWiseApp() {
   const [authMode, setAuthMode] = useState<'create' | 'signin'>('create')
   const [accountError, setAccountError] = useState('')
   const [authLoading, setAuthLoading] = useState(false)
+
+  // Live data state
+  const [weather, setWeather] = useState<WeatherState>({ status: 'idle' })
+  const [cropsState, setCropsState] = useState<CropsState>({ status: 'idle' })
+  const countryCodeRef = useRef<string>('')
 
   const auth = useAuth()
   const supabaseReady = isSupabaseConfigured()
@@ -62,11 +168,49 @@ export function GrowWiseApp() {
 
   useEffect(() => {
     function closeOnEscape(event: KeyboardEvent) {
-      if (event.key === 'Escape') { setDetail(null); setAssistant(false); setMobileMenu(false) }
+      if (event.key === 'Escape') {
+        setDetail(null)
+        setAssistant(false)
+        setMobileMenu(false)
+      }
     }
     window.addEventListener('keydown', closeOnEscape)
     return () => window.removeEventListener('keydown', closeOnEscape)
   }, [])
+
+  // Load weather + crops when entering dashboard
+  const loadDashboardData = useCallback(async (p: FarmProfile) => {
+    if (!p.location.trim()) return
+
+    // Run weather + country code resolution in parallel
+    setWeather({ status: 'loading' })
+    setCropsState({ status: 'loading' })
+
+    const [weatherResult, countryCode] = await Promise.all([
+      fetchWeather(p.location),
+      resolveCountryCode(p.location),
+    ])
+
+    countryCodeRef.current = countryCode
+    setWeather(weatherResult)
+
+    // Now fetch crops with the country code
+    const cropsResult = await fetchCrops(p, countryCode)
+    setCropsState(cropsResult)
+  }, [])
+
+  // Re-load whenever view becomes 'dashboard' or profile changes while on dashboard
+  useEffect(() => {
+    if (view === 'dashboard' && profile.location.trim()) {
+      loadDashboardData(profile)
+    }
+    // If we leave dashboard, reset to idle so next visit triggers a fresh load
+    if (view !== 'dashboard') {
+      setWeather({ status: 'idle' })
+      setCropsState({ status: 'idle' })
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view])
 
   function enterDemo() {
     setProfile({ ...initialProfile, name: 'Amina' })
@@ -91,7 +235,6 @@ export function GrowWiseApp() {
     const password = String(data.get('password') || '')
     const region = String(data.get('region') || '').trim()
 
-    // Basic validation — only email allowed when Supabase is configured
     const isEmail = contact.includes('@') && contact.split('@').length === 2 && contact.split('@')[1].includes('.')
     const isPhone = Array.from(contact).every((c) => '0123456789+(). -'.includes(c)) && contact.replace(/\D/g, '').length >= 7
     const contactIsValid = supabaseReady ? isEmail : (isEmail || isPhone)
@@ -107,7 +250,6 @@ export function GrowWiseApp() {
 
     setAccountError('')
 
-    // ── Demo mode (no Supabase) ──────────────────────────────────────────────
     if (!supabaseReady) {
       if (authMode === 'create') setProfile({ ...initialProfile, name, location: region })
       setAccountFeedback(
@@ -118,32 +260,17 @@ export function GrowWiseApp() {
       return
     }
 
-    // ── Live Supabase auth ───────────────────────────────────────────────────
     setAuthLoading(true)
     try {
       if (authMode === 'create') {
-        const { error } = await auth.signUp({
-          email: contact,
-          password,
-          name,
-          region,
-          language,
-        })
-        if (error) {
-          setAccountError(error)
-          return
-        }
-        // Supabase sends a confirmation email by default
+        const { error } = await auth.signUp({ email: contact, password, name, region, language })
+        if (error) { setAccountError(error); return }
         setAccountFeedback(
           'Account created! Check your email for a confirmation link, then sign in. You can also continue in demo mode while you wait.'
         )
       } else {
         const { error } = await auth.signIn({ email: contact, password })
-        if (error) {
-          setAccountError(error)
-          return
-        }
-        // onAuthStateChange will update auth.status; redirect to setup
+        if (error) { setAccountError(error); return }
         setAccountFeedback('')
         setView('setup')
       }
@@ -152,7 +279,9 @@ export function GrowWiseApp() {
     }
   }
 
-  // Show a loading shimmer while auth initialises (only when Supabase is configured)
+  // Decide which crops to pass: live from API or fallback demo
+  const displayCrops: Crop[] = cropsState.status === 'success' ? cropsState.crops : demoCrops
+
   const authInitialising = supabaseReady && auth.status === 'loading'
 
   return (
@@ -168,10 +297,18 @@ export function GrowWiseApp() {
 
             {view === 'dashboard' && (
               <nav className="desktop-nav" aria-label="Main navigation">
-                <button className="nav-item active" onClick={() => setView('dashboard')}><Sun aria-hidden="true" /> Dashboard</button>
-                <button className="nav-item" onClick={editInputs}><Sprout aria-hidden="true" /> My farm</button>
-                <button className="nav-item" onClick={() => setDetail(demoCrops[0])}><Leaf aria-hidden="true" /> Crop guide</button>
-                <button className="nav-item" onClick={() => openAssistant()}><CircleHelp aria-hidden="true" /> Help</button>
+                <button className="nav-item active" onClick={() => setView('dashboard')}>
+                  <Sun aria-hidden="true" /> Dashboard
+                </button>
+                <button className="nav-item" onClick={editInputs}>
+                  <Sprout aria-hidden="true" /> My farm
+                </button>
+                <button className="nav-item" onClick={() => displayCrops.length > 0 && setDetail(displayCrops[0])}>
+                  <Leaf aria-hidden="true" /> Crop guide
+                </button>
+                <button className="nav-item" onClick={() => openAssistant()}>
+                  <CircleHelp aria-hidden="true" /> Help
+                </button>
               </nav>
             )}
 
@@ -188,7 +325,9 @@ export function GrowWiseApp() {
               </label>
 
               {view === 'welcome' && (
-                <button className="top-signin" onClick={() => { setAuthMode('signin'); setAccountFeedback(''); setView('register') }}>Sign in</button>
+                <button className="top-signin" onClick={() => { setAuthMode('signin'); setAccountFeedback(''); setView('register') }}>
+                  Sign in
+                </button>
               )}
 
               {view === 'dashboard' && (
@@ -203,13 +342,22 @@ export function GrowWiseApp() {
               )}
 
               {view === 'dashboard' && auth.status === 'authenticated' && (
-                <button className="top-signin" onClick={handleSignOut} title="Sign out" style={{ display: 'flex', alignItems: 'center', gap: '0.3em' }}>
+                <button
+                  className="top-signin"
+                  onClick={handleSignOut}
+                  title="Sign out"
+                  style={{ display: 'flex', alignItems: 'center', gap: '0.3em' }}
+                >
                   <LogOut size={16} aria-hidden="true" /> Sign out
                 </button>
               )}
 
               {view === 'dashboard' && (
-                <button className="menu-toggle" onClick={() => setMobileMenu(!mobileMenu)} aria-label={mobileMenu ? 'Close menu' : 'Open menu'}>
+                <button
+                  className="menu-toggle"
+                  onClick={() => setMobileMenu(!mobileMenu)}
+                  aria-label={mobileMenu ? 'Close menu' : 'Open menu'}
+                >
                   {mobileMenu ? <X aria-hidden="true" /> : <Menu aria-hidden="true" />}
                 </button>
               )}
@@ -220,7 +368,9 @@ export function GrowWiseApp() {
             <nav className="mobile-menu" aria-label="Mobile navigation">
               <button onClick={() => { setView('dashboard'); setMobileMenu(false) }}><Sun aria-hidden="true" /> Dashboard</button>
               <button onClick={() => { editInputs(); setMobileMenu(false) }}><Sprout aria-hidden="true" /> My farm</button>
-              <button onClick={() => { setDetail(demoCrops[0]); setMobileMenu(false) }}><Leaf aria-hidden="true" /> Crop guide</button>
+              <button onClick={() => { displayCrops.length > 0 && setDetail(displayCrops[0]); setMobileMenu(false) }}>
+                <Leaf aria-hidden="true" /> Crop guide
+              </button>
               <button onClick={() => { openAssistant(); setMobileMenu(false) }}><CircleHelp aria-hidden="true" /> Help</button>
               {auth.status === 'authenticated' && (
                 <button onClick={handleSignOut}><LogOut aria-hidden="true" /> Sign out</button>
@@ -233,12 +383,20 @@ export function GrowWiseApp() {
             <main className="welcome-main">
               <section className="hero-section">
                 <div className="hero-copy">
-                  <span className="eyebrow hero-eyebrow"><span className="eyebrow-dot" /> A LITTLE MORE CERTAINTY, SEASON BY SEASON</span>
+                  <span className="eyebrow hero-eyebrow">
+                    <span className="eyebrow-dot" /> A LITTLE MORE CERTAINTY, SEASON BY SEASON
+                  </span>
                   <h1>Better choices<br />start <em>with your soil.</em></h1>
-                  <p className="hero-description">A practical crop planning companion for small-scale farmers. Explore options using the details you know about your farm.</p>
+                  <p className="hero-description">
+                    A practical crop planning companion for small-scale farmers. Explore options using the details you know about your farm.
+                  </p>
                   <div className="hero-ctas">
-                    <Button className="primary-button hero-primary" size="lg" onClick={enterDemo}>Try the demo <ArrowRight data-icon="inline-end" /></Button>
-                    <button className="hero-secondary" onClick={() => { setAuthMode('create'); setAccountFeedback(''); setView('register') }}>Create an account <ArrowRight aria-hidden="true" /></button>
+                    <Button className="primary-button hero-primary" size="lg" onClick={enterDemo}>
+                      Try the demo <ArrowRight data-icon="inline-end" />
+                    </Button>
+                    <button className="hero-secondary" onClick={() => { setAuthMode('create'); setAccountFeedback(''); setView('register') }}>
+                      Create an account <ArrowRight aria-hidden="true" />
+                    </button>
                   </div>
                   <div className="hero-reassurance">
                     <span><ShieldCheck aria-hidden="true" /> Demo details stay in this session</span>
@@ -246,26 +404,55 @@ export function GrowWiseApp() {
                   </div>
                 </div>
                 <div className="hero-visual">
-                  <Image src="/growwise-hero.png" alt="A farmer checking young green crops in a sunlit field" fill priority sizes="(max-width: 800px) 100vw, 55vw" className="hero-image" />
+                  <Image
+                    src="/growwise-hero.png"
+                    alt="A farmer checking young green crops in a sunlit field"
+                    fill
+                    priority
+                    sizes="(max-width: 800px) 100vw, 55vw"
+                    className="hero-image"
+                  />
                   <div className="hero-image-shade" />
                   <div className="floating-note">
                     <span className="floating-note-icon"><Leaf aria-hidden="true" /></span>
-                    <span><strong>Advice that starts with you</strong><small>Your land. Your season. Your decisions.</small></span>
+                    <span>
+                      <strong>Advice that starts with you</strong>
+                      <small>Your land. Your season. Your decisions.</small>
+                    </span>
                   </div>
-                  <div className="hero-image-caption"><span>GROW WITH WHAT YOU KNOW</span><small>Local knowledge matters most.</small></div>
+                  <div className="hero-image-caption">
+                    <span>GROW WITH WHAT YOU KNOW</span>
+                    <small>Local knowledge matters most.</small>
+                  </div>
                   <span className="hero-sun" aria-hidden="true"><Sun /></span>
                 </div>
               </section>
 
               <section className="welcome-features">
-                <div><span className="feature-icon"><Sprout aria-hidden="true" /></span><strong>Start with your soil</strong><p>Use a soil report or a simple visual estimate.</p></div>
-                <div><span className="feature-icon"><MapPin aria-hidden="true" /></span><strong>Grounded in your farm</strong><p>Bring in your region, season, and water access.</p></div>
-                <div><span className="feature-icon"><MessageCircle aria-hidden="true" /></span><strong>Understand every option</strong><p>See what shaped a suggestion and what&apos;s still unknown.</p></div>
+                <div>
+                  <span className="feature-icon"><Sprout aria-hidden="true" /></span>
+                  <strong>Start with your soil</strong>
+                  <p>Use a soil report or a simple visual estimate.</p>
+                </div>
+                <div>
+                  <span className="feature-icon"><MapPin aria-hidden="true" /></span>
+                  <strong>Grounded in your farm</strong>
+                  <p>Bring in your region, season, and water access.</p>
+                </div>
+                <div>
+                  <span className="feature-icon"><MessageCircle aria-hidden="true" /></span>
+                  <strong>Understand every option</strong>
+                  <p>See what shaped a suggestion and what&apos;s still unknown.</p>
+                </div>
               </section>
 
               <section className="welcome-note">
                 <span><CircleHelp aria-hidden="true" /></span>
-                <p><strong>A decision-support tool, not a promise.</strong> Recommendations are for exploration. Weather and local agronomic services require a Gemini API key.</p>
+                <p>
+                  <strong>A decision-support tool, not a promise.</strong>{' '}
+                  Recommendations use live FAO crop data and weather from Open-Meteo where available.
+                  Verify important decisions with a local agricultural expert.
+                </p>
                 <button onClick={() => setView('register')}>Create account <ArrowRight aria-hidden="true" /></button>
               </section>
 
@@ -279,12 +466,18 @@ export function GrowWiseApp() {
           {/* ── Register / Sign-in ───────────────────────────────────────────── */}
           {view === 'register' && (
             <main className="register-page">
-              <button className="text-button back-welcome" onClick={() => { setView('welcome'); setAccountFeedback('') }}>← Back to welcome</button>
+              <button className="text-button back-welcome" onClick={() => { setView('welcome'); setAccountFeedback('') }}>
+                ← Back to welcome
+              </button>
               <section className="register-card">
                 <div className="register-illustration">
                   <div className="register-icon"><Sprout aria-hidden="true" /></div>
                   <h2>Welcome to a more thoughtful growing season.</h2>
-                  <p>{supabaseReady ? 'Create a secure account to save your farm profile.' : 'Create a local prototype profile, or skip ahead and explore the demo.'}</p>
+                  <p>
+                    {supabaseReady
+                      ? 'Create a secure account to save your farm profile.'
+                      : 'Create a local prototype profile, or skip ahead and explore the demo.'}
+                  </p>
                   <div className="register-sun"><Sun aria-hidden="true" /></div>
                   <div className="register-terrain" />
                 </div>
@@ -319,13 +512,28 @@ export function GrowWiseApp() {
                       </label>
                       <label htmlFor="password">
                         Password <span>8+ characters</span>
-                        <input id="password" name="password" className="text-input" type="password" placeholder={authMode === 'create' ? 'Create a password' : 'Enter your password'} autoComplete={authMode === 'create' ? 'new-password' : 'current-password'} required minLength={8} />
+                        <input
+                          id="password"
+                          name="password"
+                          className="text-input"
+                          type="password"
+                          placeholder={authMode === 'create' ? 'Create a password' : 'Enter your password'}
+                          autoComplete={authMode === 'create' ? 'new-password' : 'current-password'}
+                          required
+                          minLength={8}
+                        />
                       </label>
                       {authMode === 'create' && (
                         <div className="register-row">
                           <label htmlFor="preferred-language">
                             Preferred language
-                            <select id="preferred-language" name="language" className="text-input" value={language} onChange={(e) => setLanguage(e.target.value as Language)}>
+                            <select
+                              id="preferred-language"
+                              name="language"
+                              className="text-input"
+                              value={language}
+                              onChange={(e) => setLanguage(e.target.value as Language)}
+                            >
                               {(Object.keys(languageNames) as Language[]).map((code) => (
                                 <option key={code} value={code}>{languageNames[code]}</option>
                               ))}
@@ -346,7 +554,12 @@ export function GrowWiseApp() {
                         </p>
                       )}
 
-                      <Button className="primary-button register-submit" type="submit" size="lg" disabled={authLoading || authInitialising}>
+                      <Button
+                        className="primary-button register-submit"
+                        type="submit"
+                        size="lg"
+                        disabled={authLoading || authInitialising}
+                      >
                         {authLoading
                           ? <><Loader2 size={18} style={{ animation: 'spin 1s linear infinite' }} aria-hidden="true" /> {authMode === 'create' ? 'Creating account…' : 'Signing in…'}</>
                           : <>{authMode === 'create' ? 'Create profile' : 'Sign in'} <ArrowRight data-icon="inline-end" /></>}
@@ -367,7 +580,11 @@ export function GrowWiseApp() {
                         </>
                       )}
 
-                      <button type="button" className="auth-switch" onClick={() => { setAuthMode(authMode === 'create' ? 'signin' : 'create'); setAccountError('') }}>
+                      <button
+                        type="button"
+                        className="auth-switch"
+                        onClick={() => { setAuthMode(authMode === 'create' ? 'signin' : 'create'); setAccountError('') }}
+                      >
                         {authMode === 'create' ? 'Already have an account? Sign in' : 'New to GrowWise? Create an account'}
                       </button>
                     </form>
@@ -394,7 +611,6 @@ export function GrowWiseApp() {
               onChange={setProfile}
               onBack={() => setView('welcome')}
               onComplete={async () => {
-                // Persist farm profile to Supabase if signed in
                 if (auth.status === 'authenticated') {
                   const { error } = await auth.upsertProfile({
                     name: profile.name,
@@ -406,10 +622,7 @@ export function GrowWiseApp() {
                     budget_preference: profile.budget || null,
                     fertilizer_access: profile.fertilizer || null,
                   })
-                  if (error) {
-                    // Return error to wizard so it can show inline feedback
-                    return { error }
-                  }
+                  if (error) return { error }
                 }
                 setView('dashboard')
                 return { error: null }
@@ -420,7 +633,8 @@ export function GrowWiseApp() {
           {view === 'dashboard' && (
             <CropDashboard
               profile={profile}
-              crops={demoCrops}
+              cropsState={cropsState}
+              weather={weather}
               onEdit={editInputs}
               onStartOver={() => { setProfile(initialProfile); setView('welcome') }}
               onDetails={setDetail}
@@ -451,7 +665,9 @@ export function GrowWiseApp() {
             <nav className="mobile-bottom-nav" aria-label="Quick navigation">
               <button className="active" onClick={() => setView('dashboard')}><Sun aria-hidden="true" /><span>Home</span></button>
               <button onClick={editInputs}><Sprout aria-hidden="true" /><span>My farm</span></button>
-              <button onClick={() => setDetail(demoCrops[0])}><Leaf aria-hidden="true" /><span>Crop guide</span></button>
+              <button onClick={() => displayCrops.length > 0 && setDetail(displayCrops[0])}>
+                <Leaf aria-hidden="true" /><span>Crop guide</span>
+              </button>
               <button onClick={() => openAssistant()}><MessageCircle aria-hidden="true" /><span>Help</span></button>
             </nav>
           )}
